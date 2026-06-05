@@ -38,24 +38,22 @@ jobs:
     runs-on: [self-hosted, odoo-deploy]
     timeout-minutes: 30
 
-    # ── Repo URLs map ──────────────────────────────────────────────────────
     env:
-      REPO_URL_HR:        git@github.com:Icanio-Odoo/HR-Repo.git
-      REPO_URL_FINANCE:   git@github.com:Icanio-Odoo/Finance-Team-Repo.git
+      REPO_URL_HR:         git@github.com:Icanio-Odoo/HR-Repo.git
+      REPO_URL_FINANCE:    git@github.com:Icanio-Odoo/Finance-Team-Repo.git
       REPO_URL_TECHSCHOOL: git@github.com:Icanio-Odoo/TechSchool-Repo.git
-      REPO_URL_ADDONS:    git@github.com:Icanio-Odoo/odoo-addons.git
-      NAMESPACE:          ${{ vars.ODOO_NAMESPACE }}
-      EFS_PATH:           ${{ vars.EFS_ADDONS_PATH }}
-      ODOO_DB:            ${{ secrets.ODOO_DB_NAME }}
-      ODOO_URL:           ${{ vars.ODOO_URL }}
-      ODOO_CONF:          /etc/odoo/odoo.conf
-      ODOO_BIN:           /usr/bin/odoo
+      REPO_URL_ADDONS:     git@github.com:Icanio-Odoo/odoo-addons.git
+      NAMESPACE:           ${{ vars.ODOO_NAMESPACE }}
+      EFS_PATH:            ${{ vars.EFS_ADDONS_PATH }}
+      ODOO_DB:             ${{ secrets.ODOO_DB_NAME }}
+      ODOO_URL:            ${{ vars.ODOO_URL }}
+      ODOO_CONF:           /etc/odoo/odoo.conf
+      ODOO_BIN:            /usr/bin/odoo
 
     steps:
 
       # ────────────────────────────────────────────────────────────────────
       # STAGE 1 — CHECKOUT
-      # Clone or pull the repo on the runner VM
       # ────────────────────────────────────────────────────────────────────
       - name: "Stage 1 — Checkout"
         run: |
@@ -65,7 +63,6 @@ jobs:
           echo "  Branch : ${{ inputs.branch }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # Resolve repo URL and local dir from repo_key
           case "${{ inputs.repo_key }}" in
             hr)         REPO_URL="$REPO_URL_HR";         REPO_DIR="$HOME/HR-Repo" ;;
             finance)    REPO_URL="$REPO_URL_FINANCE";    REPO_DIR="$HOME/Finance-Team-Repo" ;;
@@ -74,17 +71,16 @@ jobs:
             *) echo "::error::Unknown repo key: ${{ inputs.repo_key }}"; exit 1 ;;
           esac
 
-          # Save for later stages
           echo "REPO_DIR=$REPO_DIR" >> $GITHUB_ENV
           echo "ADDONS_SRC=$REPO_DIR/custom_addons" >> $GITHUB_ENV
 
           if [ -d "$REPO_DIR/.git" ]; then
-            echo "Repo exists — pulling latest..."
+            echo "Repo exists — syncing to latest..."
             cd "$REPO_DIR"
             git fetch origin
             git checkout "${{ inputs.branch }}"
-            git pull origin "${{ inputs.branch }}"
-            echo "✅ Pulled latest from ${{ inputs.branch }}"
+            git reset --hard origin/"${{ inputs.branch }}"
+            echo "✅ Reset to latest origin/${{ inputs.branch }}"
           else
             echo "Cloning repo..."
             git clone -b "${{ inputs.branch }}" "$REPO_URL" "$REPO_DIR"
@@ -93,10 +89,6 @@ jobs:
 
       # ────────────────────────────────────────────────────────────────────
       # STAGE 2 — DETECT CHANGES (EFS diff)
-      # Compare each module in custom_addons/ against EFS
-      # New module     → mark for INSTALL
-      # Changed module → mark for UPGRADE
-      # No change      → skip
       # ────────────────────────────────────────────────────────────────────
       - name: "Stage 2 — Detect changes (EFS diff)"
         run: |
@@ -108,7 +100,6 @@ jobs:
 
           INSTALL_MODS=""
           UPGRADE_MODS=""
-          SKIP_MODS=""
 
           if [ ! -d "$ADDONS_SRC" ]; then
             echo "::error::custom_addons directory not found at $ADDONS_SRC"
@@ -120,19 +111,16 @@ jobs:
 
             # Skip OCA repo folders (no __manifest__.py at root)
             if [ ! -f "$MODULE_PATH/__manifest__.py" ]; then
-              echo "  [SKIP] $MODULE — not a direct Odoo module (OCA folder)"
+              echo "  [SKIP] $MODULE — OCA folder, not a direct module"
               continue
             fi
 
             EFS_MODULE="$EFS_PATH/$MODULE"
 
             if [ ! -d "$EFS_MODULE" ]; then
-              # Module does not exist on EFS at all → INSTALL
-              echo "  [NEW]     $MODULE → will be INSTALLED"
+              echo "  [NEW]       $MODULE → will be INSTALLED"
               INSTALL_MODS="$INSTALL_MODS $MODULE"
-
             else
-              # Module exists on EFS → diff to check if changed
               DIFF=$(diff -rq \
                 --exclude="*.pyc" \
                 --exclude="__pycache__" \
@@ -140,47 +128,35 @@ jobs:
                 "$MODULE_PATH" "$EFS_MODULE" 2>/dev/null || true)
 
               if [ -n "$DIFF" ]; then
-                echo "  [CHANGED] $MODULE → will be UPGRADED"
+                echo "  [CHANGED]   $MODULE → will be UPGRADED"
                 UPGRADE_MODS="$UPGRADE_MODS $MODULE"
               else
                 echo "  [NO CHANGE] $MODULE → skipping"
-                SKIP_MODS="$SKIP_MODS $MODULE"
               fi
             fi
           done
 
-          # Trim leading spaces
           INSTALL_MODS=$(echo "$INSTALL_MODS" | xargs)
           UPGRADE_MODS=$(echo "$UPGRADE_MODS" | xargs)
 
-          # Save for later stages
           echo "INSTALL_MODS=$INSTALL_MODS" >> $GITHUB_ENV
           echo "UPGRADE_MODS=$UPGRADE_MODS" >> $GITHUB_ENV
 
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  DETECTION SUMMARY"
-          if [ -n "$INSTALL_MODS" ]; then
-            echo "  🆕 To INSTALL : $INSTALL_MODS"
-          fi
-          if [ -n "$UPGRADE_MODS" ]; then
-            echo "  🔄 To UPGRADE : $UPGRADE_MODS"
-          fi
+          [ -n "$INSTALL_MODS" ] && echo "  🆕 To INSTALL : $INSTALL_MODS"
+          [ -n "$UPGRADE_MODS" ] && echo "  🔄 To UPGRADE : $UPGRADE_MODS"
           if [ -z "$INSTALL_MODS" ] && [ -z "$UPGRADE_MODS" ]; then
             echo "  ✅ No changes detected — nothing to deploy"
-          fi
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-          # Exit early if nothing to do
-          if [ -z "$INSTALL_MODS" ] && [ -z "$UPGRADE_MODS" ]; then
             echo "no_changes=true" >> $GITHUB_ENV
           else
             echo "no_changes=false" >> $GITHUB_ENV
           fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       # ────────────────────────────────────────────────────────────────────
       # STAGE 3 — COPY TO EFS
-      # Only copy modules that are new or changed
       # ────────────────────────────────────────────────────────────────────
       - name: "Stage 3 — Copy changed modules to EFS"
         if: env.no_changes == 'false'
@@ -203,13 +179,11 @@ jobs:
             sudo chown -R uuidd:uuidd "$DEST"
             echo "  ✅ $MODULE copied"
           done
-
           echo ""
           echo "  All modules copied to EFS successfully"
 
       # ────────────────────────────────────────────────────────────────────
       # STAGE 4 — INSTALL / UPGRADE IN ODOO
-      # Get pod, read admin password, run -i or -u
       # ────────────────────────────────────────────────────────────────────
       - name: "Stage 4 — Install / Upgrade modules in Odoo"
         if: env.no_changes == 'false'
@@ -221,7 +195,6 @@ jobs:
           echo "  STAGE 4 — INSTALL / UPGRADE"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          # Get pod name
           POD=$(kubectl get pod -n "$NAMESPACE" -l app=odoo \
             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
@@ -230,11 +203,8 @@ jobs:
             exit 1
           fi
           echo "  Pod: $POD"
-
-          # Save pod name for next stage
           echo "POD=$POD" >> $GITHUB_ENV
 
-          # ── Install new modules ──
           if [ -n "$INSTALL_MODS" ]; then
             INSTALL_CSV=$(echo "$INSTALL_MODS" | tr ' ' ',')
             echo ""
@@ -247,7 +217,6 @@ jobs:
             echo "  ✅ Install completed"
           fi
 
-          # ── Upgrade changed modules ──
           if [ -n "$UPGRADE_MODS" ]; then
             UPGRADE_CSV=$(echo "$UPGRADE_MODS" | tr ' ' ',')
             echo ""
@@ -288,7 +257,6 @@ jobs:
           echo "  Repo   : ${{ inputs.repo_key }}"
           echo "  Branch : ${{ inputs.branch }}"
           echo ""
-
           if [ "$no_changes" = "true" ]; then
             echo "  ✅ No changes detected — nothing was deployed"
           elif [ "${{ job.status }}" = "success" ]; then
