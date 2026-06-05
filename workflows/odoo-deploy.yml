@@ -1,11 +1,7 @@
 # =============================================================================
 # Reusable Odoo Deployment Workflow
-# Repo   : Icanio-Odoo/.github
-# Path   : .github/workflows/odoo-deploy.yml
-#
-# Called by each repo's caller workflow on push to `development`.
-# The self-hosted runner must be registered at the org level with
-# the label "odoo-deploy" (see runner-setup/README.md).
+# Repo : Icanio-Odoo/.github
+# Path : .github/workflows/odoo-deploy.yml
 # =============================================================================
 
 name: Odoo Deploy (reusable)
@@ -14,35 +10,44 @@ on:
   workflow_call:
     inputs:
       repo_key:
-        description: "Short key for deploy.sh — one of: hr | finance | techschool | addons"
+        description: "Short key: hr | finance | techschool | addons"
         required: true
         type: string
       branch:
-        description: "Branch to deploy (default: development)"
+        description: "Branch to deploy"
         required: false
         type: string
         default: "development"
     secrets:
       DEPLOY_SCRIPT_PATH:
-        description: "Absolute path to deploy.sh on the runner VM"
+        required: true
+      ODOO_DB_NAME:
+        required: true
+      ODOO_ADMIN_PASSWORD:
         required: true
 
 jobs:
   deploy:
     name: Deploy ${{ inputs.repo_key }} → Odoo
-    runs-on: [self-hosted, odoo-deploy]   # matches runner label on the VM
+    runs-on: [self-hosted, odoo-deploy]
     timeout-minutes: 30
 
     steps:
-      # ── 1. Confirm runner context ──────────────────────────────────────
       - name: Runner info
         run: |
-          echo "Runner:  $RUNNER_NAME"
+          echo "Runner  : $RUNNER_NAME"
           echo "Repo key: ${{ inputs.repo_key }}"
-          echo "Branch:   ${{ inputs.branch }}"
+          echo "Branch  : ${{ inputs.branch }}"
 
-      # ── 2. Run deploy.sh ───────────────────────────────────────────────
       - name: Run deploy.sh
+        env:
+          # ── Sensitive — from GitHub Secrets ──
+          ODOO_DB_NAME:        ${{ secrets.ODOO_DB_NAME }}
+          ODOO_ADMIN_PASSWORD: ${{ secrets.ODOO_ADMIN_PASSWORD }}
+          # ── Non-sensitive — from GitHub Variables ──
+          ODOO_NAMESPACE:      ${{ vars.ODOO_NAMESPACE }}
+          EFS_ADDONS_PATH:     ${{ vars.EFS_ADDONS_PATH }}
+          ODOO_URL:            ${{ vars.ODOO_URL }}
         run: |
           SCRIPT="${{ secrets.DEPLOY_SCRIPT_PATH }}"
 
@@ -51,13 +56,9 @@ jobs:
             exit 1
           fi
 
-          if [ ! -x "$SCRIPT" ]; then
-            chmod +x "$SCRIPT"
-          fi
-
+          chmod +x "$SCRIPT"
           "$SCRIPT" "${{ inputs.repo_key }}" --branch "${{ inputs.branch }}"
 
-      # ── 3. Post result ─────────────────────────────────────────────────
       - name: Deployment summary
         if: always()
         run: |
