@@ -1,7 +1,15 @@
 # =============================================================================
-# Reusable Odoo Deployment Workflow
+# Reusable Odoo Deployment Workflow — EFS Diff Based
 # Repo : Icanio-Odoo/.github
 # Path : .github/workflows/odoo-deploy.yml
+#
+# Stages (all auto after PR merge):
+#   1. Checkout       → clone/pull the repo on runner VM
+#   2. Detect         → diff EFS vs repo to find new/changed modules
+#   3. Copy to EFS    → copy only changed/new modules to EFS
+#   4. Install/Upgrade→ -i for new modules, -u for changed modules
+#   5. Restart Pod    → kubectl rollout restart
+#   6. Summary        → show what was deployed
 # =============================================================================
 
 name: Odoo Deploy (reusable)
@@ -19,8 +27,6 @@ on:
         type: string
         default: "development"
     secrets:
-      DEPLOY_SCRIPT_PATH:
-        required: true
       ODOO_DB_NAME:
         required: true
       ODOO_ADMIN_PASSWORD:
@@ -28,42 +34,268 @@ on:
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.repo_key }} → Odoo
+    name: "Deploy ${{ inputs.repo_key }}"
     runs-on: [self-hosted, odoo-deploy]
     timeout-minutes: 30
 
+    # ── Repo URLs map ──────────────────────────────────────────────────────
+    env:
+      REPO_URL_HR:        git@github.com:Icanio-Odoo/HR-Repo.git
+      REPO_URL_FINANCE:   git@github.com:Icanio-Odoo/Finance-Team-Repo.git
+      REPO_URL_TECHSCHOOL: git@github.com:Icanio-Odoo/TechSchool-Repo.git
+      REPO_URL_ADDONS:    git@github.com:Icanio-Odoo/odoo-addons.git
+      NAMESPACE:          ${{ vars.ODOO_NAMESPACE }}
+      EFS_PATH:           ${{ vars.EFS_ADDONS_PATH }}
+      ODOO_DB:            ${{ secrets.ODOO_DB_NAME }}
+      ODOO_URL:           ${{ vars.ODOO_URL }}
+      ODOO_CONF:          /etc/odoo/odoo.conf
+      ODOO_BIN:           /usr/bin/odoo
+
     steps:
-      - name: Runner info
-        run: |
-          echo "Runner  : $RUNNER_NAME"
-          echo "Repo key: ${{ inputs.repo_key }}"
-          echo "Branch  : ${{ inputs.branch }}"
 
-      - name: Run deploy.sh
-        env:
-          # ── Sensitive — from GitHub Secrets ──
-          ODOO_DB_NAME:        ${{ secrets.ODOO_DB_NAME }}
-          ODOO_ADMIN_PASSWORD: ${{ secrets.ODOO_ADMIN_PASSWORD }}
-          # ── Non-sensitive — from GitHub Variables ──
-          ODOO_NAMESPACE:      ${{ vars.ODOO_NAMESPACE }}
-          EFS_ADDONS_PATH:     ${{ vars.EFS_ADDONS_PATH }}
-          ODOO_URL:            ${{ vars.ODOO_URL }}
+      # ────────────────────────────────────────────────────────────────────
+      # STAGE 1 — CHECKOUT
+      # Clone or pull the repo on the runner VM
+      # ────────────────────────────────────────────────────────────────────
+      - name: "Stage 1 — Checkout"
         run: |
-          SCRIPT="${{ secrets.DEPLOY_SCRIPT_PATH }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  STAGE 1 — CHECKOUT"
+          echo "  Repo   : ${{ inputs.repo_key }}"
+          echo "  Branch : ${{ inputs.branch }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          if [ ! -f "$SCRIPT" ]; then
-            echo "::error::deploy.sh not found at $SCRIPT"
+          # Resolve repo URL and local dir from repo_key
+          case "${{ inputs.repo_key }}" in
+            hr)         REPO_URL="$REPO_URL_HR";         REPO_DIR="$HOME/HR-Repo" ;;
+            finance)    REPO_URL="$REPO_URL_FINANCE";    REPO_DIR="$HOME/Finance-Team-Repo" ;;
+            techschool) REPO_URL="$REPO_URL_TECHSCHOOL"; REPO_DIR="$HOME/TechSchool-Repo" ;;
+            addons)     REPO_URL="$REPO_URL_ADDONS";     REPO_DIR="$HOME/odoo-addons" ;;
+            *) echo "::error::Unknown repo key: ${{ inputs.repo_key }}"; exit 1 ;;
+          esac
+
+          # Save for later stages
+          echo "REPO_DIR=$REPO_DIR" >> $GITHUB_ENV
+          echo "ADDONS_SRC=$REPO_DIR/custom_addons" >> $GITHUB_ENV
+
+          if [ -d "$REPO_DIR/.git" ]; then
+            echo "Repo exists — pulling latest..."
+            cd "$REPO_DIR"
+            git fetch origin
+            git checkout "${{ inputs.branch }}"
+            git pull origin "${{ inputs.branch }}"
+            echo "✅ Pulled latest from ${{ inputs.branch }}"
+          else
+            echo "Cloning repo..."
+            git clone -b "${{ inputs.branch }}" "$REPO_URL" "$REPO_DIR"
+            echo "✅ Cloned into $REPO_DIR"
+          fi
+
+      # ────────────────────────────────────────────────────────────────────
+      # STAGE 2 — DETECT CHANGES (EFS diff)
+      # Compare each module in custom_addons/ against EFS
+      # New module     → mark for INSTALL
+      # Changed module → mark for UPGRADE
+      # No change      → skip
+      # ────────────────────────────────────────────────────────────────────
+      - name: "Stage 2 — Detect changes (EFS diff)"
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  STAGE 2 — DETECT CHANGES"
+          echo "  Comparing repo modules vs EFS: $EFS_PATH"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          INSTALL_MODS=""
+          UPGRADE_MODS=""
+          SKIP_MODS=""
+
+          if [ ! -d "$ADDONS_SRC" ]; then
+            echo "::error::custom_addons directory not found at $ADDONS_SRC"
             exit 1
           fi
 
-          chmod +x "$SCRIPT"
-          "$SCRIPT" "${{ inputs.repo_key }}" --branch "${{ inputs.branch }}"
+          for MODULE_PATH in "$ADDONS_SRC"/*/; do
+            MODULE=$(basename "$MODULE_PATH")
 
-      - name: Deployment summary
+            # Skip OCA repo folders (no __manifest__.py at root)
+            if [ ! -f "$MODULE_PATH/__manifest__.py" ]; then
+              echo "  [SKIP] $MODULE — not a direct Odoo module (OCA folder)"
+              continue
+            fi
+
+            EFS_MODULE="$EFS_PATH/$MODULE"
+
+            if [ ! -d "$EFS_MODULE" ]; then
+              # Module does not exist on EFS at all → INSTALL
+              echo "  [NEW]     $MODULE → will be INSTALLED"
+              INSTALL_MODS="$INSTALL_MODS $MODULE"
+
+            else
+              # Module exists on EFS → diff to check if changed
+              DIFF=$(diff -rq \
+                --exclude="*.pyc" \
+                --exclude="__pycache__" \
+                --exclude=".git" \
+                "$MODULE_PATH" "$EFS_MODULE" 2>/dev/null || true)
+
+              if [ -n "$DIFF" ]; then
+                echo "  [CHANGED] $MODULE → will be UPGRADED"
+                UPGRADE_MODS="$UPGRADE_MODS $MODULE"
+              else
+                echo "  [NO CHANGE] $MODULE → skipping"
+                SKIP_MODS="$SKIP_MODS $MODULE"
+              fi
+            fi
+          done
+
+          # Trim leading spaces
+          INSTALL_MODS=$(echo "$INSTALL_MODS" | xargs)
+          UPGRADE_MODS=$(echo "$UPGRADE_MODS" | xargs)
+
+          # Save for later stages
+          echo "INSTALL_MODS=$INSTALL_MODS" >> $GITHUB_ENV
+          echo "UPGRADE_MODS=$UPGRADE_MODS" >> $GITHUB_ENV
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  DETECTION SUMMARY"
+          if [ -n "$INSTALL_MODS" ]; then
+            echo "  🆕 To INSTALL : $INSTALL_MODS"
+          fi
+          if [ -n "$UPGRADE_MODS" ]; then
+            echo "  🔄 To UPGRADE : $UPGRADE_MODS"
+          fi
+          if [ -z "$INSTALL_MODS" ] && [ -z "$UPGRADE_MODS" ]; then
+            echo "  ✅ No changes detected — nothing to deploy"
+          fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Exit early if nothing to do
+          if [ -z "$INSTALL_MODS" ] && [ -z "$UPGRADE_MODS" ]; then
+            echo "no_changes=true" >> $GITHUB_ENV
+          else
+            echo "no_changes=false" >> $GITHUB_ENV
+          fi
+
+      # ────────────────────────────────────────────────────────────────────
+      # STAGE 3 — COPY TO EFS
+      # Only copy modules that are new or changed
+      # ────────────────────────────────────────────────────────────────────
+      - name: "Stage 3 — Copy changed modules to EFS"
+        if: env.no_changes == 'false'
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  STAGE 3 — COPY TO EFS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          ALL_DEPLOY_MODS="$INSTALL_MODS $UPGRADE_MODS"
+
+          for MODULE in $ALL_DEPLOY_MODS; do
+            SRC="$ADDONS_SRC/$MODULE"
+            DEST="$EFS_PATH/$MODULE"
+
+            echo "  Copying $MODULE → EFS..."
+            sudo mkdir -p "$DEST"
+            sudo chown -R admin:admin "$DEST" 2>/dev/null || true
+            cp -ruf "$SRC/." "$DEST/"
+            sudo chown -R uuidd:uuidd "$DEST"
+            echo "  ✅ $MODULE copied"
+          done
+
+          echo ""
+          echo "  All modules copied to EFS successfully"
+
+      # ────────────────────────────────────────────────────────────────────
+      # STAGE 4 — INSTALL / UPGRADE IN ODOO
+      # Get pod, read admin password, run -i or -u
+      # ────────────────────────────────────────────────────────────────────
+      - name: "Stage 4 — Install / Upgrade modules in Odoo"
+        if: env.no_changes == 'false'
+        env:
+          ODOO_ADMIN_PASSWORD: ${{ secrets.ODOO_ADMIN_PASSWORD }}
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  STAGE 4 — INSTALL / UPGRADE"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Get pod name
+          POD=$(kubectl get pod -n "$NAMESPACE" -l app=odoo \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+          if [ -z "$POD" ]; then
+            echo "::error::No running Odoo pod found in namespace '$NAMESPACE'"
+            exit 1
+          fi
+          echo "  Pod: $POD"
+
+          # Save pod name for next stage
+          echo "POD=$POD" >> $GITHUB_ENV
+
+          # ── Install new modules ──
+          if [ -n "$INSTALL_MODS" ]; then
+            INSTALL_CSV=$(echo "$INSTALL_MODS" | tr ' ' ',')
+            echo ""
+            echo "  🆕 Installing: $INSTALL_CSV"
+            kubectl exec "$POD" -n "$NAMESPACE" -- \
+              python3 "$ODOO_BIN" -c "$ODOO_CONF" \
+              -i "$INSTALL_CSV" \
+              --stop-after-init \
+              --without-demo=all
+            echo "  ✅ Install completed"
+          fi
+
+          # ── Upgrade changed modules ──
+          if [ -n "$UPGRADE_MODS" ]; then
+            UPGRADE_CSV=$(echo "$UPGRADE_MODS" | tr ' ' ',')
+            echo ""
+            echo "  🔄 Upgrading: $UPGRADE_CSV"
+            kubectl exec "$POD" -n "$NAMESPACE" -- \
+              python3 "$ODOO_BIN" -c "$ODOO_CONF" \
+              -u "$UPGRADE_CSV" \
+              --stop-after-init \
+              --without-demo=all
+            echo "  ✅ Upgrade completed"
+          fi
+
+      # ────────────────────────────────────────────────────────────────────
+      # STAGE 5 — RESTART POD
+      # ────────────────────────────────────────────────────────────────────
+      - name: "Stage 5 — Restart Odoo pod"
+        if: env.no_changes == 'false'
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  STAGE 5 — RESTART POD"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          kubectl rollout restart deployment/odoo -n "$NAMESPACE"
+          kubectl rollout status deployment/odoo -n "$NAMESPACE" --timeout=120s
+          echo "  ✅ Pod restarted successfully"
+
+      # ────────────────────────────────────────────────────────────────────
+      # STAGE 6 — SUMMARY
+      # ────────────────────────────────────────────────────────────────────
+      - name: "Stage 6 — Deployment summary"
         if: always()
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "✅ Deployed ${{ inputs.repo_key }} (${{ inputs.branch }}) successfully"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  DEPLOYMENT SUMMARY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Repo   : ${{ inputs.repo_key }}"
+          echo "  Branch : ${{ inputs.branch }}"
+          echo ""
+
+          if [ "$no_changes" = "true" ]; then
+            echo "  ✅ No changes detected — nothing was deployed"
+          elif [ "${{ job.status }}" = "success" ]; then
+            echo "  ✅ DEPLOYMENT SUCCESSFUL"
+            [ -n "$INSTALL_MODS" ] && echo "  🆕 Installed : $INSTALL_MODS"
+            [ -n "$UPGRADE_MODS" ] && echo "  🔄 Upgraded  : $UPGRADE_MODS"
           else
-            echo "❌ Deployment of ${{ inputs.repo_key }} failed — check logs above"
+            echo "  ❌ DEPLOYMENT FAILED — check logs above"
           fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
