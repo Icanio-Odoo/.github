@@ -1,13 +1,14 @@
 # =============================================================================
-# Reusable Odoo Deployment Workflow — EFS Diff Based
+# Reusable Odoo Deployment Workflow — Git Commit Based
 # Repo : Icanio-Odoo/.github
 # Path : .github/workflows/odoo-deploy.yml
 #
 # Stages (all auto after PR merge):
 #   1. Checkout       → clone/pull the repo on runner VM
-#   2. Detect         → diff EFS vs repo to find new/changed modules
-#   3. Copy to EFS    → copy only changed/new modules to EFS
+#   2. Detect         → compare git commits vs EFS to find new/changed modules
+#   3. Copy to EFS    → copy only changed/new modules to EFS + save commit hash
 #   4. Install/Upgrade→ -i for new modules, -u for changed modules
+#                     → force upgrade if force_upgrade_mods is set
 #   5. Restart Pod    → kubectl rollout restart
 #   6. Summary        → show what was deployed
 # =============================================================================
@@ -26,6 +27,11 @@ on:
         required: false
         type: string
         default: "development"
+      force_upgrade_mods:
+        description: "Comma-separated modules to force upgrade even if no file change (e.g. manpower_request,hr_expense_custom)"
+        required: false
+        type: string
+        default: ""
     secrets:
       ODOO_DB_NAME:
         required: true
@@ -88,14 +94,15 @@ jobs:
           fi
 
       # ────────────────────────────────────────────────────────────────────
-      # STAGE 2 — DETECT CHANGES (EFS diff)
+      # STAGE 2 — DETECT CHANGES (Git Commit Based)
       # ────────────────────────────────────────────────────────────────────
-      - name: "Stage 2 — Detect changes (EFS diff)"
+      - name: "Stage 2 — Detect changes (commit-based)"
         run: |
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  STAGE 2 — DETECT CHANGES"
-          echo "  Comparing repo modules vs EFS: $EFS_PATH"
+          echo "  Comparing git commits vs EFS: $EFS_PATH"
+          echo "  Commits stored at: $EFS_PATH/.commits/"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
           INSTALL_MODS=""
@@ -105,6 +112,9 @@ jobs:
             echo "::error::custom_addons directory not found at $ADDONS_SRC"
             exit 1
           fi
+
+          # Ensure commits tracking directory exists on EFS
+          mkdir -p "$EFS_PATH/.commits"
 
           for MODULE_PATH in "$ADDONS_SRC"/*/; do
             MODULE=$(basename "$MODULE_PATH")
@@ -116,22 +126,49 @@ jobs:
             fi
 
             EFS_MODULE="$EFS_PATH/$MODULE"
+            COMMIT_FILE="$EFS_PATH/.commits/$MODULE"
+
+            # Get the latest git commit hash for this module
+            CURRENT_COMMIT=$(git -C "$REPO_DIR" log -1 --format="%H" -- "custom_addons/$MODULE" 2>/dev/null)
+
+            if [ -z "$CURRENT_COMMIT" ]; then
+              echo "  [WARN] $MODULE — no git history found, falling back to file diff"
+              # Fallback to file diff if no git history
+              if [ ! -d "$EFS_MODULE" ]; then
+                echo "  [NEW]       $MODULE → will be INSTALLED"
+                INSTALL_MODS="$INSTALL_MODS $MODULE"
+              else
+                DIFF=$(diff -rq \
+                  --exclude="*.pyc" \
+                  --exclude="__pycache__" \
+                  --exclude=".git" \
+                  "$MODULE_PATH" "$EFS_MODULE" 2>/dev/null || true)
+                if [ -n "$DIFF" ]; then
+                  echo "  [CHANGED]   $MODULE → will be UPGRADED (file diff)"
+                  UPGRADE_MODS="$UPGRADE_MODS $MODULE"
+                else
+                  echo "  [NO CHANGE] $MODULE → skipping"
+                fi
+              fi
+              continue
+            fi
 
             if [ ! -d "$EFS_MODULE" ]; then
-              echo "  [NEW]       $MODULE → will be INSTALLED"
+              echo "  [NEW]       $MODULE → will be INSTALLED (commit: ${CURRENT_COMMIT:0:8})"
               INSTALL_MODS="$INSTALL_MODS $MODULE"
-            else
-              DIFF=$(diff -rq \
-                --exclude="*.pyc" \
-                --exclude="__pycache__" \
-                --exclude=".git" \
-                "$MODULE_PATH" "$EFS_MODULE" 2>/dev/null || true)
 
-              if [ -n "$DIFF" ]; then
+            elif [ ! -f "$COMMIT_FILE" ]; then
+              echo "  [CHANGED]   $MODULE → will be UPGRADED (no previous commit recorded)"
+              UPGRADE_MODS="$UPGRADE_MODS $MODULE"
+
+            else
+              DEPLOYED_COMMIT=$(cat "$COMMIT_FILE")
+              if [ "$DEPLOYED_COMMIT" != "$CURRENT_COMMIT" ]; then
                 echo "  [CHANGED]   $MODULE → will be UPGRADED"
+                echo "              deployed: ${DEPLOYED_COMMIT:0:8} → current: ${CURRENT_COMMIT:0:8}"
                 UPGRADE_MODS="$UPGRADE_MODS $MODULE"
               else
-                echo "  [NO CHANGE] $MODULE → skipping"
+                echo "  [NO CHANGE] $MODULE → skipping (commit: ${CURRENT_COMMIT:0:8})"
               fi
             fi
           done
@@ -147,7 +184,9 @@ jobs:
           echo "  DETECTION SUMMARY"
           [ -n "$INSTALL_MODS" ] && echo "  🆕 To INSTALL : $INSTALL_MODS"
           [ -n "$UPGRADE_MODS" ] && echo "  🔄 To UPGRADE : $UPGRADE_MODS"
-          if [ -z "$INSTALL_MODS" ] && [ -z "$UPGRADE_MODS" ]; then
+          [ -n "${{ inputs.force_upgrade_mods }}" ] && echo "  🔧 To FORCE UPGRADE : ${{ inputs.force_upgrade_mods }}"
+
+          if [ -z "$INSTALL_MODS" ] && [ -z "$UPGRADE_MODS" ] && [ -z "${{ inputs.force_upgrade_mods }}" ]; then
             echo "  ✅ No changes detected — nothing to deploy"
             echo "no_changes=true" >> $GITHUB_ENV
           else
@@ -156,7 +195,7 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
       # ────────────────────────────────────────────────────────────────────
-      # STAGE 3 — COPY TO EFS
+      # STAGE 3 — COPY TO EFS + SAVE COMMIT HASH
       # ────────────────────────────────────────────────────────────────────
       - name: "Stage 3 — Copy changed modules to EFS"
         if: env.no_changes == 'false'
@@ -166,19 +205,30 @@ jobs:
           echo "  STAGE 3 — COPY TO EFS"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+          mkdir -p "$EFS_PATH/.commits"
           ALL_DEPLOY_MODS="$INSTALL_MODS $UPGRADE_MODS"
 
           for MODULE in $ALL_DEPLOY_MODS; do
             SRC="$ADDONS_SRC/$MODULE"
             DEST="$EFS_PATH/$MODULE"
+            COMMIT_FILE="$EFS_PATH/.commits/$MODULE"
 
             echo "  Copying $MODULE → EFS..."
             sudo mkdir -p "$DEST"
             sudo chown -R admin:admin "$DEST" 2>/dev/null || true
             cp -ruf "$SRC/." "$DEST/"
             sudo chown -R uuidd:uuidd "$DEST"
-            echo "  ✅ $MODULE copied"
+
+            # Save the deployed commit hash
+            CURRENT_COMMIT=$(git -C "$REPO_DIR" log -1 --format="%H" -- "custom_addons/$MODULE" 2>/dev/null)
+            if [ -n "$CURRENT_COMMIT" ]; then
+              echo "$CURRENT_COMMIT" > "$COMMIT_FILE"
+              echo "  ✅ $MODULE copied (commit: ${CURRENT_COMMIT:0:8} saved)"
+            else
+              echo "  ✅ $MODULE copied (no commit hash to save)"
+            fi
           done
+
           echo ""
           echo "  All modules copied to EFS successfully"
 
@@ -205,6 +255,19 @@ jobs:
           echo "  Pod: $POD"
           echo "POD=$POD" >> $GITHUB_ENV
 
+          # ── Force upgrade (even if no file change) ──
+          if [ -n "${{ inputs.force_upgrade_mods }}" ]; then
+            echo ""
+            echo "  🔧 Force upgrading: ${{ inputs.force_upgrade_mods }}"
+            kubectl exec "$POD" -n "$NAMESPACE" -- \
+              python3 "$ODOO_BIN" -c "$ODOO_CONF" \
+              -u "${{ inputs.force_upgrade_mods }}" \
+              --stop-after-init \
+              --without-demo=all
+            echo "  ✅ Force upgrade completed"
+          fi
+
+          # ── Install new modules ──
           if [ -n "$INSTALL_MODS" ]; then
             INSTALL_CSV=$(echo "$INSTALL_MODS" | tr ' ' ',')
             echo ""
@@ -217,6 +280,7 @@ jobs:
             echo "  ✅ Install completed"
           fi
 
+          # ── Upgrade changed modules ──
           if [ -n "$UPGRADE_MODS" ]; then
             UPGRADE_CSV=$(echo "$UPGRADE_MODS" | tr ' ' ',')
             echo ""
@@ -261,8 +325,9 @@ jobs:
             echo "  ✅ No changes detected — nothing was deployed"
           elif [ "${{ job.status }}" = "success" ]; then
             echo "  ✅ DEPLOYMENT SUCCESSFUL"
-            [ -n "$INSTALL_MODS" ] && echo "  🆕 Installed : $INSTALL_MODS"
-            [ -n "$UPGRADE_MODS" ] && echo "  🔄 Upgraded  : $UPGRADE_MODS"
+            [ -n "${{ inputs.force_upgrade_mods }}" ] && echo "  🔧 Force Upgraded : ${{ inputs.force_upgrade_mods }}"
+            [ -n "$INSTALL_MODS" ]                    && echo "  🆕 Installed      : $INSTALL_MODS"
+            [ -n "$UPGRADE_MODS" ]                    && echo "  🔄 Upgraded       : $UPGRADE_MODS"
           else
             echo "  ❌ DEPLOYMENT FAILED — check logs above"
           fi
